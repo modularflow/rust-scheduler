@@ -1,27 +1,30 @@
 use polars::prelude::*;
-use schedule_tool::graph::builder::GraphBuilder;
+use schedule_tool::graph::schedule_dag::ScheduleDag;
 
 fn df_with_preds(ids: &[i32], preds: &[Vec<i32>]) -> DataFrame {
     let id_series = Series::new("id".into(), ids.to_vec());
+    let duration_series = Series::new("duration_days".into(), vec![1_i64; ids.len()]);
     let preds_series_list: Vec<Series> = preds
         .iter()
         .map(|v| Series::new("".into(), v.clone()))
         .collect();
     let preds_series = Series::new("predecessors".into(), preds_series_list);
-    DataFrame::new(vec![id_series.into_column(), preds_series.into_column()]).unwrap()
+    DataFrame::new(vec![
+        id_series.into_column(),
+        duration_series.into_column(),
+        preds_series.into_column(),
+    ]).unwrap()
 }
 
 #[test]
-fn simple_fan_out_produces_two_branches() {
+fn schedule_dag_builds_edges_from_predecessors() {
     // 1 -> {2, 3}
     let df = df_with_preds(&[1, 2, 3], &vec![vec![], vec![1], vec![1]]);
-    let builder = GraphBuilder::new(&df);
-    let tree = builder.build().unwrap();
+    let dag = ScheduleDag::build(&df).unwrap();
 
-    assert_eq!(tree.branches.len(), 2);
-    assert!(tree.join_points.contains_key(&1));
-    assert!(tree.task_to_branch.contains_key(&2));
-    assert!(tree.task_to_branch.contains_key(&3));
+    // Expect 3 nodes and 2 edges
+    assert_eq!(dag.graph.node_count(), 3);
+    assert_eq!(dag.graph.edge_count(), 2);
 }
 
 

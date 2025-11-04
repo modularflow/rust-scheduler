@@ -182,6 +182,28 @@ impl WorkCalendar {
         }
         current
     }
+
+    /// Find the previous available date before a given date
+    pub fn prev_available(&self, from: NaiveDate) -> NaiveDate {
+        let mut current = from - Duration::days(1);
+        while !self.is_available(current) {
+            current = current - Duration::days(1);
+        }
+        current
+    }
+    
+    /// Find a date N available days back (inverse of find_next_available)
+    pub fn find_prev_available(&self, from: NaiveDate, days_back: i64) -> NaiveDate {
+        let mut current = from;
+        let mut count = 0;
+        while count < days_back {
+            current = current - Duration::days(1);
+            if self.is_available(current) {
+                count += 1;
+            }
+        }
+        current
+    }
     
     /// Get all available days in a date range
     pub fn available_days_in_range(&self, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {

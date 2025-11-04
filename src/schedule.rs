@@ -1,16 +1,13 @@
 use polars::prelude::*;
 use polars::prelude::PlSmallStr;
-use chrono::{NaiveDate, Datelike, Weekday, Duration};
-use std::collections::HashSet;
+use chrono::{NaiveDate, Duration};
+use std::collections::HashMap;
 use crate::calendar::WorkCalendar;
+use crate::calculations::forward_pass::ForwardPass as CalcForwardPass;
+use crate::calculations::backward_pass::BackwardPass as CalcBackwardPass;
 use crate::metadata::ScheduleMetadata;
 
-struct DateColumns {
-    start_date: NaiveDate,
-    end_date: NaiveDate,
-    duration: Duration,
-    deadline: NaiveDate,
-}
+// (removed unused DateColumns struct)
 
 
 pub struct Schedule {
@@ -35,9 +32,9 @@ impl Schedule {
         self.metadata = metadata;
     }
 
-    fn set_calendar(&mut self, calendar: WorkCalendar) {
-        self.calendar = calendar;
-    }
+    
+
+    
 
     pub fn dataframe(&self) -> &DataFrame {
         &self.df
@@ -70,183 +67,11 @@ impl Schedule {
         schema
     }
 
-    fn get_predecessors(&self, task_id: i32) -> Result<Vec<i32>, PolarsError> {
-        let row = self.df.clone().lazy()
-            .filter(col("id").eq(lit(task_id)))
-            .select([col("predecessors")])
-            .collect()?;
+    
         
-        if row.height() == 0 {
-            return Err(PolarsError::NoData(format!("Task ID {} not found", task_id).into()));
-        }
-        
-        let predecessors_col = row.column("predecessors")?;
-        let list_chunked = predecessors_col.list()?;
-        
-        // get_as_series returns Option<Series>, not Option<Option<Series>>
-        let preds = match list_chunked.get_as_series(0) {
-            Some(series) => {
-                series.i32()?.into_iter()
-                    .filter_map(|x| x)
-                    .collect()
-            }
-            None => Vec::new()
-        };
-        
-        Ok(preds)
-    }
+    
 
-    fn get_early_finish_dates(&self, task_ids: Vec<i32>) -> Result<Vec<NaiveDate>, PolarsError> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        // Use lazy evaluation with filter on multiple IDs
-        let mut filters = col("id").eq(lit(task_ids[0]));
-        for &id in &task_ids[1..] {
-            filters = filters.or(col("id").eq(lit(id)));
-        }
-        
-        let filtered = self.df.clone().lazy()
-            .filter(filters)
-            .select([col("early_finish")])
-            .collect()?;
-        
-        let early_finish_col = filtered.column("early_finish")?;
-        let dates: Vec<NaiveDate> = early_finish_col.date()?
-            .into_iter()
-            .filter_map(|days_opt| {
-                days_opt.map(Self::i32_to_date)
-            })
-            .collect();
-        
-        Ok(dates)
-    }
-
-    /// Calculate and update the early start and early finish for a task based on its predecessors
-    fn calculate_task_early_dates(&mut self, task_id: i32) -> Result<(NaiveDate, NaiveDate), PolarsError> {
-        // Get predecessors
-        let predecessors = self.get_predecessors(task_id)?;
-        
-        // Determine early start date
-        let early_start = if predecessors.is_empty() {
-            // No predecessors: use project start date
-            self.metadata.project_start_date
-        } else {
-            // Get early finish dates of predecessors
-            let pred_finish_dates = self.get_early_finish_dates(predecessors)?;
-            
-            if pred_finish_dates.is_empty() {
-                return Err(PolarsError::NoData(
-                    format!("No early finish dates found for predecessors of task {}", task_id).into()
-                ));
-            }
-            
-            // Early start is the day after the latest predecessor finishes
-            let max_pred_finish = pred_finish_dates.iter().max().unwrap();
-            self.calendar.next_available(*max_pred_finish)
-        };
-        
-        // Get task duration
-        let row = self.df.clone().lazy()
-            .filter(col("id").eq(lit(task_id)))
-            .select([col("duration_days")])
-            .collect()?;
-        
-        let duration = row.column("duration_days")?.i64()?.get(0)
-            .ok_or_else(|| PolarsError::NoData("duration_days is null".into()))?;
-        
-        // Calculate early finish using the calendar
-        let early_finish = self.calendar.find_next_available(early_start, duration);
-        
-        // Update the dataframe
-        self.update_date_column("early_start", task_id, early_start)?;
-        self.update_date_column("early_finish", task_id, early_finish)?;
-        
-        Ok((early_start, early_finish))
-    }
-        
-    fn total_float_expr() -> Expr {
-        (col("late_start") - col("early_start")).alias("total_float")
-    }
     
-    /// Expression to calculate free float
-    fn free_float_expr() -> Expr {
-        // Free float = min(successor early starts) - task early finish - 1
-        // This is simplified - you'd need actual successor logic
-        (col("successor_early_start") - col("early_finish") - lit(1))
-            .alias("free_float")
-    }
-    
-    /// Expression to identify critical path tasks (total float = 0)
-    fn is_critical_expr() -> Expr {
-        Self::total_float_expr().eq(lit(0)).alias("is_critical")
-    }
-    
-    /// Expression to calculate early finish from early start + duration
-    fn early_finish_expr() -> Expr {
-        (col("early_start") + col("duration_days")).alias("early_finish")
-    }
-    
-    /// Expression to calculate late start from late finish - duration
-    fn late_start_expr() -> Expr {
-        (col("late_finish") - col("duration_days")).alias("late_start")
-    }
-    
-    /// Filter expression for tasks with no predecessors
-    fn no_predecessors_filter() -> Expr {
-        col("predecessors").list().len().eq(lit(0))
-    }
-    
-    /// Filter expression for specific status (placeholder)
-    fn status_filter(status: &str) -> Expr {
-        col("status").eq(lit(status))
-    }
-    
-    /// Filter expression for active tasks (started but not finished)
-    fn active_tasks_filter() -> Expr {
-        col("actual_start").is_not_null()
-            .and(col("actual_finish").is_null())
-    }
-    
-    /// Expression to calculate percent complete
-    fn percent_complete_expr() -> Expr {
-        when(col("duration_days").eq(lit(0)))
-            .then(lit(100.0))
-            .otherwise(
-                col("actual_duration") / col("duration_days") * lit(100.0)
-            )
-            .alias("percent_complete")
-    }
-    
-    /// Filter for overdue tasks
-    fn overdue_filter(current_date: NaiveDate) -> Expr {
-        let current_date_days = Self::date_to_i32(current_date);
-        col("late_finish")
-            .lt(lit(current_date_days))
-            .and(col("actual_finish").is_null())
-    }
-    
-    /// Expression to calculate schedule variance (Earned Value)
-    fn schedule_variance_expr() -> Expr {
-        (col("planned_finish") - col("actual_finish"))
-            .alias("schedule_variance_days")
-    }
-
-    fn add_empty_rows(&mut self, num_rows: usize) -> Result<(), PolarsError> {
-        let empty_series: Vec<Column> = self.df.get_columns()
-            .iter()
-            .map(|col| {
-                let null_series = Series::new_null(col.name().clone(), num_rows);
-                null_series.into_column()
-            })
-            .collect();
-        
-        let empty_df = DataFrame::new(empty_series)?;
-        // Consumes old Dataframe in self.df and returns a new DataFrame as self.df
-        self.df = self.df.vstack(&empty_df)?;
-        Ok(())
-    }
 
     fn update_string_column(&mut self, column_name: &str, task_id: i32, new_value: &str) -> Result<(), PolarsError> {
         let id_col = self.df.column("id")?;
@@ -415,68 +240,126 @@ impl Schedule {
         Ok(())
     }
 
-    fn i32_to_date(days: i32) -> NaiveDate {
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        epoch + Duration::days(days as i64)
-    }
-    
     /// Convert NaiveDate to Polars i32 date
     fn date_to_i32(date: NaiveDate) -> i32 {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         (date - epoch).num_days() as i32
     }
-
-    fn calculate_finish_date(&mut self, task_id: i32) -> Result<NaiveDate, PolarsError> {
-        // Filter to just the row with this task_id
-        let row = self.df.clone().lazy()
-            .filter(col("id").eq(lit(task_id)))
-            .select([
-                col("early_start"),
-                col("duration_days"),
-            ])
-            .collect()?;
-        
-        if row.height() == 0 {
-            return Err(PolarsError::NoData(format!("Task ID {} not found", task_id).into()));
-        }
-        
-        let start_date_days = row.column("early_start")?.date()?.get(0)
-            .ok_or_else(|| PolarsError::NoData("start_date is null".into()))?;
-        let duration = row.column("duration_days")?.i64()?.get(0)
-            .ok_or_else(|| PolarsError::NoData("duration is null".into()))?;
-        
-        let start_date = Self::i32_to_date(start_date_days);
-        let finish_date = self.calendar.find_next_available(start_date, duration);
-        
-        self.update_date_column("early_finish", task_id, finish_date)?;
-        Ok(finish_date)
-    }
-
-    fn calculate_critical_path(&mut self) -> Result<(), PolarsError> {
-        self.df = self.df.clone().lazy()
-            .with_columns([
-                Self::early_finish_expr(),
-                Self::late_start_expr(),
-                Self::total_float_expr(),
-                Self::is_critical_expr(),
-            ])
-            .collect()?;
-        Ok(())
-    }
+    
     
     pub fn forward_pass(&mut self) -> Result<(), PolarsError> {
-        // Calculate early start/finish for all tasks
-        // Start with tasks that have no predecessors
-        let _start_tasks = self.df.clone().lazy()
-            .filter(Self::no_predecessors_filter())
-            .with_column(
-                lit(Self::date_to_i32(self.metadata.project_start_date))
-                    .alias("early_start")
-            )
-            .with_column(Self::early_finish_expr())
-            .collect()?;
-        
-        // Then propagate through successors...
+        if self.df.height() == 0 { return Ok(()); }
+        let engine = CalcForwardPass::new(&self.df, &self.calendar);
+        let results = engine.execute(self.metadata.project_start_date)?;
+
+        // Persist results into early_start / early_finish
+        let id_ca = self.df.column("id")?.i32()?;
+        let height = self.df.height();
+        let mut start_vals: Vec<Option<i32>> = vec![None; height];
+        let mut finish_vals: Vec<Option<i32>> = vec![None; height];
+
+        for (idx, id_opt) in id_ca.into_iter().enumerate() {
+            if let Some(task_id) = id_opt {
+                if let Some((es, ef)) = results.get(&task_id) {
+                    start_vals[idx] = Some(Self::date_to_i32(*es));
+                    finish_vals[idx] = Some(Self::date_to_i32(*ef));
+                } else {
+                    // Fallback compute for tasks not covered by the engine (e.g., join points)
+                    let preds_lc = self.df.column("predecessors")?.list()?;
+                    let duration = self.df.column("duration_days")?.i64()?.get(idx).unwrap_or(0);
+                    let pred_ids: Vec<i32> = if let Some(series) = preds_lc.get_as_series(idx) {
+                        series.i32()?.into_iter().flatten().collect()
+                    } else { Vec::new() };
+                    let project_start = self.metadata.project_start_date;
+                    let early_start = if pred_ids.is_empty() {
+                        project_start
+                    } else {
+                        let max_pred_finish = pred_ids.iter()
+                            .filter_map(|p| results.get(p).map(|(_, ef)| *ef))
+                            .max()
+                            .unwrap_or(project_start);
+                        self.calendar.next_available(max_pred_finish)
+                    };
+                    let early_finish = self.calendar.find_next_available(early_start, duration);
+                    start_vals[idx] = Some(Self::date_to_i32(early_start));
+                    finish_vals[idx] = Some(Self::date_to_i32(early_finish));
+                }
+            }
+        }
+
+        let start_series = Series::new(PlSmallStr::from_static("early_start"), start_vals).cast(&DataType::Date)?;
+        let finish_series = Series::new(PlSmallStr::from_static("early_finish"), finish_vals).cast(&DataType::Date)?;
+        self.df.replace("early_start", start_series)?;
+        self.df.replace("early_finish", finish_series)?;
+
+        Ok(())
+    }
+
+    pub fn backward_pass(&mut self) -> Result<(), PolarsError> {
+        if self.df.height() == 0 { return Ok(()); }
+        // Compute late dates using petgraph engine
+        let engine = CalcBackwardPass::new(&self.df, &self.calendar);
+        let results = engine.execute(self.metadata.project_end_date)?;
+
+        // Persist late_start / late_finish
+        let id_ca = self.df.column("id")?.i32()?;
+        let height = self.df.height();
+        let mut ls_vals: Vec<Option<i32>> = vec![None; height];
+        let mut lf_vals: Vec<Option<i32>> = vec![None; height];
+        for (idx, id_opt) in id_ca.into_iter().enumerate() {
+            if let Some(task_id) = id_opt {
+                if let Some((ls, lf)) = results.get(&task_id) {
+                    ls_vals[idx] = Some(Self::date_to_i32(*ls));
+                    lf_vals[idx] = Some(Self::date_to_i32(*lf));
+                }
+            }
+        }
+        // Fallback fill: if any late values remain None, use early counterparts to avoid nulls
+        let es_dates = self.df.column("early_start")?.date()?;
+        let ef_dates = self.df.column("early_finish")?.date()?;
+        for i in 0..height {
+            if ls_vals[i].is_none() {
+                if let Some(es_i) = es_dates.get(i) { ls_vals[i] = Some(es_i); }
+            }
+            if lf_vals[i].is_none() {
+                if let Some(ef_i) = ef_dates.get(i) { lf_vals[i] = Some(ef_i); }
+            }
+        }
+
+        let ls_series = Series::new(PlSmallStr::from_static("late_start"), ls_vals).cast(&DataType::Date)?;
+        let lf_series = Series::new(PlSmallStr::from_static("late_finish"), lf_vals).cast(&DataType::Date)?;
+        self.df.replace("late_start", ls_series)?;
+        self.df.replace("late_finish", lf_series)?;
+
+        // Compute total_float and is_critical
+        let es_col = self.df.column("early_start")?.date()?;
+        let mut es_map: HashMap<i32, i32> = HashMap::new();
+        for (i, id_opt) in self.df.column("id")?.i32()?.into_iter().enumerate() {
+            if let Some(id) = id_opt {
+                if let Some(es_days) = es_col.get(i) { es_map.insert(id, es_days); }
+            }
+        }
+        let id_ca2 = self.df.column("id")?.i32()?;
+        let ls_col = self.df.column("late_start")?.date()?;
+        let mut tf_vals: Vec<i64> = Vec::with_capacity(height);
+        let mut crit_vals: Vec<bool> = Vec::with_capacity(height);
+        for (i, id_opt) in id_ca2.into_iter().enumerate() {
+            if let Some(id) = id_opt {
+                let es_days = es_map.get(&id).copied().unwrap_or(0) as i64;
+                let ls_days = ls_col.get(i).unwrap_or(0) as i64;
+                let tf = ls_days - es_days;
+                tf_vals.push(tf);
+                crit_vals.push(tf == 0);
+            } else {
+                tf_vals.push(0);
+                crit_vals.push(false);
+            }
+        }
+        let tf_series = Series::new(PlSmallStr::from_static("total_float"), tf_vals);
+        let crit_series = Series::new(PlSmallStr::from_static("is_critical"), crit_vals);
+        self.df.replace("total_float", tf_series)?;
+        self.df.replace("is_critical", crit_series)?;
+
         Ok(())
     }
 
@@ -588,7 +471,7 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, Datelike};
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -625,62 +508,7 @@ mod tests {
         assert_eq!(dur, 7);
     }
 
-    #[test]
-    fn get_predecessors_and_update_list_columns() {
-        let mut s = Schedule::new();
-        s.upsert_task(1, "Task 1", 2, None).unwrap();
-        s.upsert_task(2, "Task 2", 3, Some(vec![1])).unwrap();
-
-        let preds = s.get_predecessors(2).unwrap();
-        assert_eq!(preds, vec![1]);
-
-        // Replace successors list via setter
-        s.update_list_i32_column("successors", 1, vec![2]).unwrap();
-        let row = s.df.clone().lazy()
-            .filter(col("id").eq(lit(1)))
-            .select([col("successors")])
-            .collect()
-            .unwrap();
-        let list = row.column("successors").unwrap().list().unwrap();
-        let inner = list.get_as_series(0).unwrap();
-        let vals: Vec<i32> = inner.i32().unwrap().into_iter().flatten().collect();
-        assert_eq!(vals, vec![2]);
-    }
-
-    #[test]
-    fn calculate_task_early_dates_for_chain() {
-        let mut s = Schedule::new();
-        // Make project start a known Monday
-        let mut md = ScheduleMetadata::default();
-        md.project_start_date = date(2025, 1, 6);
-        s.set_metadata(md);
-
-        // Two tasks in a chain: 1 -> 2
-        s.upsert_task(1, "T1", 2, None).unwrap();
-        s.upsert_task(2, "T2", 3, Some(vec![1])).unwrap();
-
-        // Calculate for task 1 then task 2
-        let (_s1, f1) = s.calculate_task_early_dates(1).unwrap();
-        let (s2, _f2) = s.calculate_task_early_dates(2).unwrap();
-
-        // Task 2 early start must be next available after task 1 finish
-        assert_eq!(s2, s.calendar.next_available(f1));
-    }
-
-    #[test]
-    fn calculate_finish_date_uses_calendar() {
-        let mut s = Schedule::new();
-        let mut md = ScheduleMetadata::default();
-        md.project_start_date = date(2025, 1, 6); // Monday
-        s.set_metadata(md);
-
-        s.upsert_task(1, "T1", 4, None).unwrap();
-        // Set early_start explicitly
-        s.update_date_column("early_start", 1, date(2025, 1, 6)).unwrap();
-
-        let finish = s.calculate_finish_date(1).unwrap();
-        // 4 working days after Monday should be Friday (skipping no holidays here)
-        assert_eq!(finish.weekday(), chrono::Weekday::Fri);
-    }
+    
+    
 }
 
