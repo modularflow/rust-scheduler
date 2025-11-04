@@ -1,0 +1,24 @@
+[package]
+name = "schedule-tool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bdays = "0.1.4"
+chrono = "0.4.42"
+polars = { version = "0.44", features = ["lazy", "dtype-date", "temporal"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"], optional = true }
+parking_lot = { version = "0.12", optional = true }
+
+[features]
+default = []
+ui = ["dep:axum", "dep:tokio", "dep:parking_lot"]
+cli_api = []
+
+[[bin]]
+name = "cli"
+path = "src/bin/cli.rs"
+required-features = ["cli_api"]
