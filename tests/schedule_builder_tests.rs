@@ -63,3 +63,87 @@ fn updating_duration_recomputes_downstream_dates() {
     assert_eq!(after_t2.early_finish, Some(d(2025, 1, 16)));
 }
 
+#[test]
+fn refresh_runs_full_pipeline() {
+    let mut schedule = Schedule::new();
+    let mut metadata = ScheduleMetadata::default();
+    metadata.project_start_date = d(2025, 1, 6);
+    metadata.project_end_date = d(2025, 1, 17);
+    schedule.set_metadata(metadata);
+
+    schedule.upsert_task(1, "T1", 2, None).unwrap();
+    schedule.upsert_task(2, "T2", 3, Some(vec![1])).unwrap();
+    schedule.upsert_task(3, "T3", 1, Some(vec![1])).unwrap();
+    schedule.upsert_task(4, "T4", 2, Some(vec![2, 3])).unwrap();
+
+    let summary = schedule.refresh().unwrap();
+
+    assert_eq!(summary.task_count, 4);
+    assert_eq!(summary.critical_count, 3);
+    assert_eq!(summary.latest_finish, Some(d(2025, 1, 17)));
+    assert_eq!(summary.positive_variance_count, 0);
+    assert_eq!(summary.negative_variance_count, 0);
+    assert_eq!(summary.on_track_variance_count, 0);
+    assert_eq!(summary.critical_path, vec![1, 2, 4]);
+
+    let df = schedule.dataframe();
+    let mut map = std::collections::HashMap::new();
+    for idx in 0..df.height() {
+        let task = Task::from_dataframe_row(df, idx).unwrap();
+        map.insert(task.id, task);
+    }
+
+    let t1 = map.get(&1).unwrap();
+    let t2 = map.get(&2).unwrap();
+    let t3 = map.get(&3).unwrap();
+    let t4 = map.get(&4).unwrap();
+
+    assert_eq!(t1.early_start, Some(d(2025, 1, 6)));
+    assert_eq!(t4.late_finish, Some(d(2025, 1, 17)));
+    assert_eq!(t2.is_critical, Some(true));
+    assert!(t3.total_float.unwrap() > 0);
+    assert_eq!(t1.successors, vec![2, 3]);
+    assert_eq!(t2.successors, vec![4]);
+    assert!(t4.successors.is_empty());
+}
+
+#[test]
+fn refresh_computes_schedule_variance_from_baseline_and_actual() {
+    let mut schedule = Schedule::new();
+    let mut metadata = ScheduleMetadata::default();
+    metadata.project_start_date = d(2025, 1, 6);
+    metadata.project_end_date = d(2025, 2, 28);
+    schedule.set_metadata(metadata);
+
+    schedule.upsert_task(1, "T1", 2, None).unwrap();
+
+    let mut task = Task::from_dataframe_row(schedule.dataframe(), 0).unwrap();
+    task.baseline_finish = Some(d(2025, 1, 8));
+    task.actual_finish = Some(d(2025, 1, 10));
+    schedule.upsert_task_record(task).unwrap();
+
+    let summary = schedule.refresh().unwrap();
+    assert_eq!(summary.positive_variance_count, 1);
+    assert_eq!(summary.negative_variance_count, 0);
+    assert_eq!(summary.on_track_variance_count, 0);
+    assert!(summary.critical_path.is_empty() || summary.critical_path == vec![1]);
+
+    let refreshed = Task::from_dataframe_row(schedule.dataframe(), 0).unwrap();
+    assert_eq!(refreshed.schedule_variance_days, Some(2));
+}
+
+#[test]
+fn refresh_errors_when_project_end_before_finish() {
+    let mut schedule = Schedule::new();
+    let mut metadata = ScheduleMetadata::default();
+    metadata.project_start_date = d(2025, 1, 6);
+    metadata.project_end_date = d(2025, 1, 10);
+    schedule.set_metadata(metadata);
+
+    schedule.upsert_task(1, "T1", 2, None).unwrap();
+    schedule.upsert_task(2, "T2", 3, Some(vec![1])).unwrap();
+
+    let err = schedule.refresh().expect_err("should fail horizon validation");
+    assert!(err.to_string().contains("precedes schedule finish"));
+}
+

@@ -1,12 +1,53 @@
 use polars::prelude::*;
 use polars::prelude::PlSmallStr;
-use chrono::{NaiveDate, Datelike};
+use chrono::{NaiveDate, Datelike, Duration};
 use std::collections::HashMap;
 use crate::calendar::WorkCalendar;
 use crate::calculations::forward_pass::ForwardPass as CalcForwardPass;
 use crate::calculations::backward_pass::BackwardPass as CalcBackwardPass;
 use crate::metadata::ScheduleMetadata;
 use crate::task::Task;
+
+#[derive(Debug, Clone)]
+pub struct RefreshSummary {
+    pub task_count: usize,
+    pub critical_count: usize,
+    pub critical_path: Vec<i32>,
+    pub latest_finish: Option<NaiveDate>,
+    pub positive_variance_count: usize,
+    pub negative_variance_count: usize,
+    pub on_track_variance_count: usize,
+}
+
+impl RefreshSummary {
+    pub fn to_cli_summary(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!("tasks={}", self.task_count));
+        parts.push(format!("critical={}", self.critical_count));
+        if let Some(date) = self.latest_finish {
+            parts.push(format!("finish={}", date));
+        }
+        if self.positive_variance_count > 0 {
+            parts.push(format!("variance+={}", self.positive_variance_count));
+        }
+        if self.negative_variance_count > 0 {
+            parts.push(format!("variance-={}", self.negative_variance_count));
+        }
+        if self.on_track_variance_count > 0 {
+            parts.push(format!("variance0={}", self.on_track_variance_count));
+        }
+        if !self.critical_path.is_empty() {
+            let chain = self
+                .critical_path
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("->");
+            parts.push(format!("crit_path={}", chain));
+        }
+        parts.join(", ")
+    }
+}
 
 // (removed unused DateColumns struct)
 
@@ -88,6 +129,8 @@ impl Schedule {
             Field::new("actual_start".into(), DataType::Date),
             Field::new("actual_finish".into(), DataType::Date),
             Field::new("percent_complete".into(), DataType::Float64),
+            Field::new("progress_measurement".into(), DataType::String),
+            Field::new("pre_defined_rationale".into(), DataType::String),
             Field::new("schedule_variance_days".into(), DataType::Int64),
             Field::new("total_float".into(), DataType::Int64),
             Field::new("is_critical".into(), DataType::Boolean),
@@ -299,6 +342,138 @@ impl Schedule {
         (date - epoch).num_days() as i32
     }
     
+    fn i32_to_date(days: i32) -> NaiveDate {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        epoch + Duration::days(days as i64)
+    }
+
+    fn date_from_chunk(chunk: &DateChunked, idx: usize) -> Option<NaiveDate> {
+        chunk.get(idx).map(Self::i32_to_date)
+    }
+
+    fn working_days_diff(cal: &WorkCalendar, baseline: NaiveDate, actual: NaiveDate) -> i64 {
+        if baseline == actual {
+            0
+        } else if actual > baseline {
+            cal.count_available_days(baseline, actual) - 1
+        } else {
+            let days = cal.count_available_days(actual, baseline) - 1;
+            -(days)
+        }
+    }
+
+    fn latest_early_finish(&self) -> Result<Option<NaiveDate>, PolarsError> {
+        if self.df.height() == 0 {
+            return Ok(None);
+        }
+        let early_finish = self.df.column("early_finish")?.date()?;
+        let mut latest: Option<NaiveDate> = None;
+        for idx in 0..early_finish.len() {
+            if let Some(days) = early_finish.get(idx) {
+                let candidate = Self::i32_to_date(days);
+                latest = Some(match latest {
+                    Some(current) if current >= candidate => current,
+                    _ => candidate,
+                });
+            }
+        }
+        Ok(latest)
+    }
+
+    fn set_schedule_variance(&mut self) -> Result<(), PolarsError> {
+        let height = self.df.height();
+        let baseline_finish = self.df.column("baseline_finish")?.date()?;
+        let actual_finish = self.df.column("actual_finish")?.date()?;
+        let baseline_start = self.df.column("baseline_start")?.date()?;
+        let actual_start = self.df.column("actual_start")?.date()?;
+
+        let mut values: Vec<Option<i64>> = Vec::with_capacity(height);
+        for idx in 0..height {
+            let variance = match (
+                Self::date_from_chunk(&baseline_finish, idx),
+                Self::date_from_chunk(&actual_finish, idx),
+            ) {
+                (Some(bf), Some(af)) => Some(Self::working_days_diff(&self.calendar, bf, af)),
+                _ => match (
+                    Self::date_from_chunk(&baseline_start, idx),
+                    Self::date_from_chunk(&actual_start, idx),
+                ) {
+                    (Some(bs), Some(as_)) => {
+                        Some(Self::working_days_diff(&self.calendar, bs, as_))
+                    }
+                    _ => None,
+                },
+            };
+            values.push(variance);
+        }
+        let series = Series::new(PlSmallStr::from_static("schedule_variance_days"), values);
+        self.df.replace("schedule_variance_days", series)?;
+        Ok(())
+    }
+
+    fn set_successors_column(&mut self) -> Result<(), PolarsError> {
+        let id_col = self.df.column("id")?.i32()?;
+        let predecessors = self.df.column("predecessors")?.list()?;
+
+        let ids: Vec<Option<i32>> = id_col.into_iter().collect();
+        let mut successors_map: HashMap<i32, Vec<i32>> = HashMap::new();
+        for opt_id in ids.iter().flatten() {
+            successors_map.entry(*opt_id).or_default();
+        }
+
+        for (idx, maybe_id) in ids.iter().enumerate() {
+            if let Some(task_id) = maybe_id {
+                if let Some(series) = predecessors.get_as_series(idx) {
+                    let pred_col = series.i32()?;
+                    for pred in pred_col.into_iter().flatten() {
+                        successors_map.entry(pred).or_default().push(*task_id);
+                    }
+                }
+            }
+        }
+
+        let successor_rows: Vec<Series> = ids
+            .into_iter()
+            .map(|maybe_id| {
+                let list = if let Some(id) = maybe_id {
+                    let mut list = successors_map.get(&id).cloned().unwrap_or_default();
+                    list.sort_unstable();
+                    list.dedup();
+                    list
+                } else {
+                    Vec::new()
+                };
+                Series::new(PlSmallStr::from_static(""), list)
+            })
+            .collect();
+
+        let list_chunked: ListChunked = successor_rows.into_iter().collect();
+        self.df
+            .replace("successors", list_chunked.into_series())?;
+        Ok(())
+    }
+
+    fn validate_project_horizon(&self) -> Result<(), PolarsError> {
+        if self.metadata.project_start_date > self.metadata.project_end_date {
+            return Err(PolarsError::ComputeError(
+                "project_end_date must be on or after project_start_date".into(),
+            ));
+        }
+
+        if let Some(latest_finish) = self.latest_early_finish()? {
+            if latest_finish > self.metadata.project_end_date {
+                return Err(PolarsError::ComputeError(
+                    format!(
+                        "project_end_date {} precedes schedule finish {}",
+                        self.metadata.project_end_date, latest_finish
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     
     pub fn forward_pass(&mut self) -> Result<(), PolarsError> {
         if self.df.height() == 0 { return Ok(()); }
@@ -416,6 +591,67 @@ impl Schedule {
         Ok(())
     }
 
+    pub fn refresh(&mut self) -> Result<RefreshSummary, PolarsError> {
+        if self.metadata.project_start_date > self.metadata.project_end_date {
+            return Err(PolarsError::ComputeError(
+                "project_end_date must be on or after project_start_date".into(),
+            ));
+        }
+
+        self.forward_pass()?;
+        self.validate_project_horizon()?;
+        self.backward_pass()?;
+        self.set_schedule_variance()?;
+        self.set_successors_column()?;
+
+        let task_count = self.df.height();
+        let id_ca = self.df.column("id")?.i32()?;
+        let tf_ca = self.df.column("total_float")?.i64()?;
+        let variance_ca = self.df.column("schedule_variance_days")?.i64()?;
+        let critical_ca = self.df.column("is_critical")?.bool()?;
+        let early_start_ca = self.df.column("early_start")?.date()?;
+
+        let mut critical_count = 0usize;
+        let mut positive_variance_count = 0usize;
+        let mut negative_variance_count = 0usize;
+        let mut on_track_variance_count = 0usize;
+        let mut critical_path: Vec<(NaiveDate, i32)> = Vec::new();
+
+        for idx in 0..task_count {
+            if let Some(true) = critical_ca.get(idx) {
+                critical_count += 1;
+            }
+            match variance_ca.get(idx) {
+                Some(v) if v > 0 => positive_variance_count += 1,
+                Some(v) if v < 0 => negative_variance_count += 1,
+                Some(_) => on_track_variance_count += 1,
+                None => {}
+            }
+            if let (Some(id), Some(tf)) = (id_ca.get(idx), tf_ca.get(idx)) {
+                if tf == 0 {
+                    let start = Self::date_from_chunk(&early_start_ca, idx)
+                        .unwrap_or(self.metadata.project_start_date);
+                    critical_path.push((start, id));
+                }
+            }
+        }
+
+        critical_path.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let critical_path_ids = critical_path.into_iter().map(|(_, id)| id).collect();
+
+        let latest_finish = self.latest_early_finish()?;
+
+        Ok(RefreshSummary {
+            task_count,
+            critical_count,
+            critical_path: critical_path_ids,
+            latest_finish,
+            positive_variance_count,
+            negative_variance_count,
+            on_track_variance_count,
+        })
+    }
+
     pub fn upsert_task(&mut self, id: i32, name: &str, duration_days: i64, predecessors: Option<Vec<i32>>) -> Result<(), PolarsError> {
         let id_exists = if self.df.height() == 0 {
             false
@@ -531,6 +767,20 @@ impl Schedule {
                 self.update_list_str_column("task_attachments", task.id, task.task_attachments.clone())?;
             }
 
+            self.update_string_column(
+                "progress_measurement",
+                task.id,
+                task.progress_measurement.as_str(),
+            )?;
+
+            let rationale_json = serde_json::to_string(&task.pre_defined_rationale)
+                .map_err(|err| PolarsError::ComputeError(err.to_string().into()))?;
+            self.update_string_column(
+                "pre_defined_rationale",
+                task.id,
+                rationale_json.as_str(),
+            )?;
+
             return Ok(());
         }
 
@@ -607,7 +857,8 @@ mod tests {
         let expected = vec![
             "id", "name", "duration_days", "predecessors", "early_start", "early_finish",
             "late_start", "late_finish", "baseline_start", "baseline_finish", "actual_start",
-            "actual_finish", "percent_complete", "schedule_variance_days", "total_float",
+            "actual_finish", "percent_complete", "progress_measurement", "pre_defined_rationale",
+            "schedule_variance_days", "total_float",
             "is_critical", "successors", "parent_id", "wbs_code", "task_notes",
             "task_attachments",
         ];

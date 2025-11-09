@@ -104,7 +104,7 @@ fn render_df_as_text_table(df: &DataFrame) -> String {
 
 fn print_help() {
     println!(
-        "Commands:\n  help                               Show this help\n  show                               Show current schedule\n  new                                Append empty task with next id\n  add <id> <name> <duration_days> [preds_csv]\n                                     Upsert a task (preds like 1,2,3)\n  bstart  <id> <YYYY-MM-DD>          Set baseline_start\n  bfinish <id> <YYYY-MM-DD>          Set baseline_finish\n  astart  <id> <YYYY-MM-DD>          Set actual_start\n  afinish <id> <YYYY-MM-DD>          Set actual_finish\n  pct     <id> <float>               Set percent_complete\n  var     <id> <i64>                 Set schedule_variance_days\n  crit    <id> <true|false>          Set is_critical\n  parent  <id> <i32>                 Set parent_id\n  wbs     <id> <code>                Set wbs_code\n  notes   <id> <text...>             Set task_notes (rest of line)\n  succ    <id> <csv>                 Set successors (e.g. 2,3)\n  compute                            Run forward pass\n  quit|exit                          Exit"
+        "Commands:\n  help                               Show this help\n  show                               Show current schedule\n  new                                Append empty task with next id\n  add <id> <name> <duration_days> [preds_csv]\n                                     Upsert a task (preds like 1,2,3)\n  bstart  <id> <YYYY-MM-DD>          Set baseline_start\n  bfinish <id> <YYYY-MM-DD>          Set baseline_finish\n  astart  <id> <YYYY-MM-DD>          Set actual_start\n  afinish <id> <YYYY-MM-DD>          Set actual_finish\n  pct     <id> <float>               Set percent_complete\n  var     <id> <i64>                 Set schedule_variance_days\n  crit    <id> <true|false>          Set is_critical\n  parent  <id> <i32>                 Set parent_id\n  wbs     <id> <code>                Set wbs_code\n  notes   <id> <text...>             Set task_notes (rest of line)\n  succ    <id> <csv>                 Set successors (e.g. 2,3)\n  compute                            Refresh schedule (forward + backward passes)\n  quit|exit                          Exit"
     );
 }
 
@@ -183,9 +183,15 @@ fn main() {
                 }
             }
             "compute" => {
-                match schedule.forward_pass() {
-                    Ok(_) => println!("Computed.\n{}", render_df_as_text_table(schedule.dataframe())),
-                    Err(e) => println!("Compute error: {}", e),
+                match schedule.refresh() {
+                    Ok(summary) => {
+                        println!(
+                            "Refreshed ({})\n{}",
+                            summary.to_cli_summary(),
+                            render_df_as_text_table(schedule.dataframe())
+                        );
+                    }
+                    Err(e) => println!("Refresh error: {}", e),
                 }
             }
             "bstart" | "bfinish" | "astart" | "afinish" => {

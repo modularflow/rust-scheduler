@@ -1,8 +1,75 @@
 use chrono::{Duration, NaiveDate};
 use polars::prelude::*;
 use polars::prelude::PlSmallStr;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProgressMeasurement {
+    #[serde(rename = "0_100")]
+    ZeroOneHundred,
+    #[serde(rename = "50_50")]
+    FiftyFifty,
+    #[serde(rename = "25_75")]
+    TwentyFiveSeventyFive,
+    #[serde(rename = "75_25")]
+    SeventyFiveTwentyFive,
+    #[serde(rename = "percent_complete")]
+    PercentComplete,
+    #[serde(rename = "pre_defined_rationale")]
+    PreDefinedRationale,
+}
+
+impl Default for ProgressMeasurement {
+    fn default() -> Self {
+        Self::PercentComplete
+    }
+}
+
+impl ProgressMeasurement {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProgressMeasurement::ZeroOneHundred => "0_100",
+            ProgressMeasurement::FiftyFifty => "50_50",
+            ProgressMeasurement::TwentyFiveSeventyFive => "25_75",
+            ProgressMeasurement::SeventyFiveTwentyFive => "75_25",
+            ProgressMeasurement::PercentComplete => "percent_complete",
+            ProgressMeasurement::PreDefinedRationale => "pre_defined_rationale",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "0_100" => Some(ProgressMeasurement::ZeroOneHundred),
+            "50_50" => Some(ProgressMeasurement::FiftyFifty),
+            "25_75" => Some(ProgressMeasurement::TwentyFiveSeventyFive),
+            "75_25" => Some(ProgressMeasurement::SeventyFiveTwentyFive),
+            "percent_complete" => Some(ProgressMeasurement::PercentComplete),
+            "pre_defined_rationale" => Some(ProgressMeasurement::PreDefinedRationale),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RationaleItem {
+    pub id: i32,
+    pub name: String,
+    pub weight: f64,
+    pub is_complete: bool,
+}
+
+impl RationaleItem {
+    pub fn new(id: i32, name: impl Into<String>, weight: f64, is_complete: bool) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            weight,
+            is_complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: i32,
     pub name: String,
@@ -25,6 +92,8 @@ pub struct Task {
     pub wbs_code: Option<String>,
     pub task_notes: Option<String>,
     pub task_attachments: Vec<String>,
+    pub progress_measurement: ProgressMeasurement,
+    pub pre_defined_rationale: Vec<RationaleItem>,
 }
 
 impl Task {
@@ -51,11 +120,13 @@ impl Task {
             wbs_code: None,
             task_notes: None,
             task_attachments: Vec::new(),
+            progress_measurement: ProgressMeasurement::default(),
+            pre_defined_rationale: Vec::new(),
         }
     }
 
     pub fn to_dataframe_row(&self) -> PolarsResult<DataFrame> {
-        let mut columns: Vec<Column> = Vec::with_capacity(20);
+        let mut columns: Vec<Column> = Vec::with_capacity(22);
 
         let id_data: [i32; 1] = [self.id];
         columns.push(Series::new(PlSmallStr::from_static("id"), id_data).into_column());
@@ -84,6 +155,24 @@ impl Task {
         columns.push(
             Series::new(PlSmallStr::from_static("percent_complete"), percent_complete)
                 .into_column(),
+        );
+
+        columns.push(
+            Series::new(
+                PlSmallStr::from_static("progress_measurement"),
+                &[self.progress_measurement.as_str()],
+            )
+            .into_column(),
+        );
+
+        let rationale_json = serde_json::to_string(&self.pre_defined_rationale)
+            .map_err(|err| PolarsError::ComputeError(err.to_string().into()))?;
+        columns.push(
+            Series::new(
+                PlSmallStr::from_static("pre_defined_rationale"),
+                &[rationale_json.as_str()],
+            )
+            .into_column(),
         );
 
         let variance: [Option<i64>; 1] = [self.schedule_variance_days];
@@ -142,6 +231,43 @@ impl Task {
         let task_attachments =
             Self::vec_from_string_list(df.column("task_attachments")?.list()?, row_idx)?;
 
+        let progress_measurement = if let Ok(col) = df.column("progress_measurement") {
+            if let Ok(ca) = col.str() {
+                if let Some(raw) = ca.get(row_idx) {
+                    ProgressMeasurement::from_str(raw).unwrap_or_default()
+                } else {
+                    ProgressMeasurement::default()
+                }
+            } else {
+                ProgressMeasurement::default()
+            }
+        } else {
+            ProgressMeasurement::default()
+        };
+
+        let pre_defined_rationale = if let Ok(col) = df.column("pre_defined_rationale") {
+            if let Ok(ca) = col.str() {
+                if let Some(raw) = ca.get(row_idx) {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        Vec::new()
+                    } else {
+                        serde_json::from_str::<Vec<RationaleItem>>(trimmed).map_err(|err| {
+                            PolarsError::ComputeError(
+                                format!("invalid pre_defined_rationale: {err}").into(),
+                            )
+                        })?
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             id,
             name,
@@ -175,6 +301,8 @@ impl Task {
                 .get(row_idx)
                 .map(ToOwned::to_owned),
             task_attachments,
+            progress_measurement,
+            pre_defined_rationale,
         })
     }
 

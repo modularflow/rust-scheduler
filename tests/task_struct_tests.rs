@@ -1,5 +1,8 @@
 use chrono::NaiveDate;
-use schedule_tool::{Schedule, Task};
+use schedule_tool::{
+    task::{ProgressMeasurement, RationaleItem},
+    Schedule, Task,
+};
 
 fn d(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -18,6 +21,11 @@ fn task_roundtrips_through_schedule_dataframe() {
     task.task_notes = Some("Initial design phase".to_string());
     task.task_attachments = vec!["spec.pdf".to_string()];
     task.parent_id = Some(7);
+    task.progress_measurement = ProgressMeasurement::FiftyFifty;
+    task.pre_defined_rationale = vec![
+        RationaleItem::new(1, "Draft", 0.5, false),
+        RationaleItem::new(2, "Review", 0.5, true),
+    ];
 
     schedule.upsert_task_record(task.clone()).unwrap();
 
@@ -35,5 +43,7 @@ fn task_roundtrips_through_schedule_dataframe() {
     assert_eq!(row.task_notes, task.task_notes);
     assert_eq!(row.task_attachments, task.task_attachments);
     assert_eq!(row.parent_id, task.parent_id);
+    assert_eq!(row.progress_measurement, task.progress_measurement);
+    assert_eq!(row.pre_defined_rationale, task.pre_defined_rationale);
 }
 

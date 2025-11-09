@@ -1,5 +1,7 @@
 use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleMetadata {
     pub project_name: String,
     pub project_description: String,
