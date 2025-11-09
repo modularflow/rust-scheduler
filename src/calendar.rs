@@ -8,41 +8,27 @@ pub struct WorkCalendar {
 
 impl Default for WorkCalendar {
     fn default() -> Self {
-        Self::defaults(2025)
+        Self::with_year_range(2025, 2025)
     }
 }
 
 impl WorkCalendar {
-    /// Create a new calendar with US federal holidays and Mon-Fri work week for a single year
-    fn defaults(year: i32) -> Self {
+    pub fn with_year_range(start_year: i32, end_year: i32) -> Self {
+        let (start, end) = if start_year <= end_year {
+            (start_year, end_year)
+        } else {
+            (end_year, start_year)
+        };
+
         let mut calendar = Self {
             holidays: HashSet::new(),
             non_working_days: HashSet::from([Weekday::Sat, Weekday::Sun]),
         };
-        
-        calendar.add_us_holidays(year);
+
+        calendar.add_us_holidays_range(start, end);
         calendar
     }
-    
-    /// Create a new calendar with US federal holidays and Mon-Fri work week for a range of years
-    fn defaults_range(start_year: i32, end_year: i32) -> Self {
-        let mut calendar = Self {
-            holidays: HashSet::new(),
-            non_working_days: HashSet::from([Weekday::Sat, Weekday::Sun]),
-        };
-        
-        calendar.add_us_holidays_range(start_year, end_year);
-        calendar
-    }
-    
-    /// Create an empty calendar
-    fn new() -> Self {
-        Self {
-            holidays: HashSet::new(),
-            non_working_days: HashSet::new(),
-        }
-    }
-    
+
     /// Add standard US federal holidays for a given year
     fn add_us_holidays(&mut self, year: i32) {
         // New Year's Day

@@ -1,11 +1,12 @@
 use polars::prelude::*;
 use polars::prelude::PlSmallStr;
-use chrono::{NaiveDate, Duration};
+use chrono::{NaiveDate, Datelike};
 use std::collections::HashMap;
 use crate::calendar::WorkCalendar;
 use crate::calculations::forward_pass::ForwardPass as CalcForwardPass;
 use crate::calculations::backward_pass::BackwardPass as CalcBackwardPass;
 use crate::metadata::ScheduleMetadata;
+use crate::task::Task;
 
 // (removed unused DateColumns struct)
 
@@ -18,17 +19,35 @@ pub struct Schedule {
 
 impl Schedule {
     pub fn new() -> Self {
+        let metadata = ScheduleMetadata::default();
+        Self::new_with_metadata(metadata)
+    }
+
+    pub fn new_with_metadata(metadata: ScheduleMetadata) -> Self {
         let schema = Self::default_schema();
         let schedule = DataFrame::empty_with_schema(&schema);
+        let calendar = Self::calendar_for_metadata(&metadata);
 
         Self {
             df: schedule,
-            metadata: ScheduleMetadata::default(),
-            calendar: WorkCalendar::default(),
+            metadata,
+            calendar,
         }
     }
 
+    pub fn new_with_year_range(start_year: i32, end_year: i32) -> Self {
+        let start = NaiveDate::from_ymd_opt(start_year, 1, 1)
+            .expect("invalid start year for schedule");
+        let end = NaiveDate::from_ymd_opt(end_year, 12, 31)
+            .expect("invalid end year for schedule");
+        let mut metadata = ScheduleMetadata::default();
+        metadata.project_start_date = start;
+        metadata.project_end_date = end;
+        Self::new_with_metadata(metadata)
+    }
+
     pub fn set_metadata(&mut self, metadata: ScheduleMetadata) {
+        self.calendar = Self::calendar_for_metadata(&metadata);
         self.metadata = metadata;
     }
 
@@ -38,6 +57,20 @@ impl Schedule {
 
     pub fn dataframe(&self) -> &DataFrame {
         &self.df
+    }
+
+    pub fn metadata(&self) -> &ScheduleMetadata {
+        &self.metadata
+    }
+
+    pub fn calendar(&self) -> &WorkCalendar {
+        &self.calendar
+    }
+
+    fn calendar_for_metadata(metadata: &ScheduleMetadata) -> WorkCalendar {
+        let start_year = metadata.project_start_date.year();
+        let end_year = metadata.project_end_date.year();
+        WorkCalendar::with_year_range(start_year, end_year)
     }
 
     fn default_schema() -> Schema {
@@ -168,6 +201,30 @@ impl Schedule {
         Ok(())
     }
 
+    fn update_list_str_column(&mut self, column_name: &str, task_id: i32, new_values: Vec<String>) -> Result<(), PolarsError> {
+        let id_col = self.df.column("id")?;
+        let target_col = self.df.column(column_name)?;
+
+        let replacement = Series::new(PlSmallStr::from_static(""), new_values);
+        let new_series = target_col
+            .list()?
+            .into_iter()
+            .zip(id_col.i32()?.into_iter())
+            .map(|(val, id)| {
+                if id == Some(task_id) {
+                    Some(replacement.clone())
+                } else {
+                    val
+                }
+            })
+            .collect::<ListChunked>()
+            .into_series()
+            .with_name(column_name.into());
+
+        self.df.replace(column_name, new_series)?;
+        Ok(())
+    }
+
     fn update_float_column(&mut self, column_name: &str, task_id: i32, new_value: f64) -> Result<(), PolarsError> {
         let id_col = self.df.column("id")?;
         let target_col = self.df.column(column_name)?;
@@ -228,15 +285,11 @@ impl Schedule {
         Ok(())
     }
 
-    fn update_duration_column(&mut self, column_name: &str, task_id: i32, new_duration: Duration) -> Result<(), PolarsError> {
-        self.df = self.df.clone().lazy()
-        .with_column(
-            when(col("id").eq(lit(task_id)))
-                .then(lit(new_duration))
-                .otherwise(col(column_name))
-                .alias(column_name)
-        )
-        .collect()?;
+    fn update_duration_column(&mut self, task_id: i32, new_duration_days: i64) -> Result<(), PolarsError> {
+        self.update_i64_column("duration_days", task_id, new_duration_days)?;
+        // Duration changes ripple through schedule calculations; recompute dates.
+        self.forward_pass()?;
+        self.backward_pass()?;
         Ok(())
     }
 
@@ -375,36 +428,113 @@ impl Schedule {
 
         if id_exists {
             self.update_string_column("name", id, name)?;
-            self.update_i64_column("duration_days", id, duration_days)?;
             if let Some(preds) = predecessors {
                 self.update_list_i32_column("predecessors", id, preds)?;
             }
+            self.update_duration_column(id, duration_days)?;
             return Ok(());
         }
 
-        // Build a single-row DataFrame matching schema, mostly nulls
-        let mut cols: Vec<Column> = self.df.get_columns()
-            .iter()
-            .map(|c| Series::new_null(c.name().clone(), 1).into_column())
-            .collect();
+        let mut task = Task::new(id, name, duration_days);
+        if let Some(preds) = predecessors {
+            task.predecessors = preds;
+        }
+        let new_row = task.to_dataframe_row()?;
+        self.df = self.df.vstack(&new_row)?;
+        Ok(())
+    }
 
-        // helper to set/replace a column by name
-        let mut set_col = |name: &str, series: Series| {
-            if let Some(idx) = cols.iter().position(|c| c.name() == name) {
-                cols[idx] = series.into_column();
-            }
+    pub fn update_task_duration(&mut self, task_id: i32, new_duration_days: i64) -> Result<(), PolarsError> {
+        self.update_duration_column(task_id, new_duration_days)
+    }
+
+    pub fn upsert_task_record(&mut self, task: Task) -> Result<(), PolarsError> {
+        let id_exists = if self.df.height() == 0 {
+            false
+        } else {
+            self.df.column("id")?
+                .i32()? 
+                .into_iter()
+                .any(|v| v == Some(task.id))
         };
 
-        set_col("id", Series::new(PlSmallStr::from_static("id"), [id]));
-        set_col("name", Series::new(PlSmallStr::from_static("name"), [name]));
-        set_col("duration_days", Series::new(PlSmallStr::from_static("duration_days"), [duration_days]));
-        let preds_vec = predecessors.unwrap_or_default();
-        // Build a List series containing one element (the predecessors for this task)
-        let preds_elem = Series::new(PlSmallStr::from_static(""), preds_vec);
-        let preds_list = Series::new(PlSmallStr::from_static("predecessors"), &[preds_elem]);
-        set_col("predecessors", preds_list);
+        if id_exists {
+            self.update_string_column("name", task.id, &task.name)?;
+            self.update_list_i32_column("predecessors", task.id, task.predecessors.clone())?;
+            self.update_duration_column(task.id, task.duration_days)?;
 
-        let new_row = DataFrame::new(cols)?;
+            if let Some(date) = task.early_start {
+                self.update_date_column("early_start", task.id, date)?;
+            }
+
+            if let Some(date) = task.early_finish {
+                self.update_date_column("early_finish", task.id, date)?;
+            }
+
+            if let Some(date) = task.late_start {
+                self.update_date_column("late_start", task.id, date)?;
+            }
+
+            if let Some(date) = task.late_finish {
+                self.update_date_column("late_finish", task.id, date)?;
+            }
+
+            if let Some(date) = task.baseline_start {
+                self.update_date_column("baseline_start", task.id, date)?;
+            }
+
+            if let Some(date) = task.baseline_finish {
+                self.update_date_column("baseline_finish", task.id, date)?;
+            }
+
+            if let Some(date) = task.actual_start {
+                self.update_date_column("actual_start", task.id, date)?;
+            }
+
+            if let Some(date) = task.actual_finish {
+                self.update_date_column("actual_finish", task.id, date)?;
+            }
+
+            if let Some(percent) = task.percent_complete {
+                self.update_float_column("percent_complete", task.id, percent)?;
+            }
+
+            if let Some(variance) = task.schedule_variance_days {
+                self.update_i64_column("schedule_variance_days", task.id, variance)?;
+            }
+
+            if let Some(total_float) = task.total_float {
+                self.update_i64_column("total_float", task.id, total_float)?;
+            }
+
+            if let Some(is_critical) = task.is_critical {
+                self.update_bool_column("is_critical", task.id, is_critical)?;
+            }
+
+            if !task.successors.is_empty() {
+                self.update_list_i32_column("successors", task.id, task.successors.clone())?;
+            }
+
+            if let Some(parent) = task.parent_id {
+                self.update_i32_column("parent_id", task.id, parent)?;
+            }
+
+            if let Some(ref wbs) = task.wbs_code {
+                self.update_string_column("wbs_code", task.id, wbs)?;
+            }
+
+            if let Some(ref notes) = task.task_notes {
+                self.update_string_column("task_notes", task.id, notes)?;
+            }
+
+            if !task.task_attachments.is_empty() {
+                self.update_list_str_column("task_attachments", task.id, task.task_attachments.clone())?;
+            }
+
+            return Ok(());
+        }
+
+        let new_row = task.to_dataframe_row()?;
         self.df = self.df.vstack(&new_row)?;
         Ok(())
     }
@@ -471,12 +601,6 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, Datelike};
-
-    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap()
-    }
-
     #[test]
     fn default_schema_contains_expected_columns() {
         let schema = Schedule::default_schema();
