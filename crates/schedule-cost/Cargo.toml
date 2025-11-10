@@ -1,0 +1,9 @@
+[package]
+name = "schedule-cost"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+schedule-tool = { path = "../schedule-core", package = "schedule-core" }
+
+
